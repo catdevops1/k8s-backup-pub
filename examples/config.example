@@ -1,0 +1,34 @@
+# Kubernetes Backup Configuration Examples
+
+# ==========================================
+# Environment Variables
+# ==========================================
+
+# Backup location (default: /mnt/backup/k8s-backups)
+export BACKUP_ROOT="/your/backup/path"
+
+# Where to check if backup drive is mounted (default: parent of BACKUP_ROOT)
+export BACKUP_MOUNT_CHECK="/mnt/backup"
+
+# Skip mount check entirely (for NFS, local disk, etc.)
+export BACKUP_MOUNT_CHECK=""
+
+# Retention period in days (default: 30)
+export RETENTION_DAYS="30"
+
+# Master node configuration for restore (defaults shown)
+export MASTER_NODE_NAME="master-node"
+export MASTER_NODE_IP="192.168.4.100"
+
+# ==========================================
+# Usage Examples
+# ==========================================
+
+# Run backup with custom location
+BACKUP_ROOT="/custom/path" sudo -E backup-k8s.sh
+
+# Run restore with custom master node settings
+MASTER_NODE_NAME="k8s-master" MASTER_NODE_IP="10.0.0.10" sudo -E restore-k8s.sh /path/to/backup
+
+# Permanent configuration (add to /etc/environment)
+echo 'export BACKUP_ROOT="/your/backup/path"' | sudo tee -a /etc/environment

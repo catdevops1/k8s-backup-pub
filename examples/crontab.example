@@ -1,0 +1,13 @@
+# Kubernetes Backup Cron Examples
+
+# Every 12 hours (midnight and noon)
+0 */12 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+
+# Daily at 2 AM
+0 2 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+
+# Every 6 hours
+0 */6 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+
+# Weekly on Sunday at 3 AM
+0 3 * * 0 /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1

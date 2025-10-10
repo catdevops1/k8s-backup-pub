@@ -1,0 +1,19 @@
+# Never commit actual backups
+backups/
+*.db
+pki-backup/
+*.conf
+*.key
+*.crt
+
+# Logs
+*.log
+
+# Personal configuration
+.env
+config.local
+secrets/
+
+# OS
+.DS_Store
+Thumbs.db
