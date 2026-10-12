@@ -1,34 +1,18 @@
-# Kubernetes Backup Configuration Examples
+# /etc/default/backup-k8s
+# Shared by backup-k8s.sh and restore-k8s.sh. Mode 600, owned by root.
+# Keep this file out of git — it holds your real bucket name and paths.
 
-# ==========================================
-# Environment Variables
-# ==========================================
+# rclone destination for cluster backups (remote:bucket/prefix). Required.
+R2_REMOTE="r2:my-bucket/cluster"
 
-# Backup location (default: /mnt/backup/k8s-backups)
-export BACKUP_ROOT="/your/backup/path"
+# Optional secondary copy. Skipped with a warning if not mounted.
+LOCAL_MOUNT="/mnt/backup"
+LOCAL_ROOT="/mnt/backup/k8s-backups"
+LOCAL_RETENTION_DAYS=30
 
-# Where to check if backup drive is mounted (default: parent of BACKUP_ROOT)
-export BACKUP_MOUNT_CHECK="/mnt/backup"
+# etcd static pod name. Default: etcd-$(hostname)
+# ETCD_POD="etcd-my-control-plane"
 
-# Skip mount check entirely (for NFS, local disk, etc.)
-export BACKUP_MOUNT_CHECK=""
-
-# Retention period in days (default: 30)
-export RETENTION_DAYS="30"
-
-# Master node configuration for restore (defaults shown)
-export MASTER_NODE_NAME="master-node"
-export MASTER_NODE_IP="192.168.4.100"
-
-# ==========================================
-# Usage Examples
-# ==========================================
-
-# Run backup with custom location
-BACKUP_ROOT="/custom/path" sudo -E backup-k8s.sh
-
-# Run restore with custom master node settings
-MASTER_NODE_NAME="k8s-master" MASTER_NODE_IP="10.0.0.10" sudo -E restore-k8s.sh /path/to/backup
-
-# Permanent configuration (add to /etc/environment)
-echo 'export BACKUP_ROOT="/your/backup/path"' | sudo tee -a /etc/environment
+# Restore only: defaults are $(hostname) and the primary IPv4 address.
+# MASTER_NAME="my-control-plane"
+# MASTER_IP="10.0.0.10"

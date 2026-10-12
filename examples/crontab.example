@@ -1,13 +1,10 @@
-# Kubernetes Backup Cron Examples
+# Root crontab (sudo crontab -e). The scripts need root for /etc/kubernetes/pki.
 
-# Every 12 hours (midnight and noon)
-0 */12 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+# Cluster backup, daily at 01:00
+0 1 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
 
-# Daily at 2 AM
-0 2 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+# Stagger anything else that writes to the same storage, e.g.:
+# 30 1 * * * /usr/local/bin/backup-vault.sh >> /var/log/vault-backup.log 2>&1
+# 0  2 * * * /usr/local/bin/backup-db-app1.sh >> /var/log/db-backup-app1.log 2>&1
 
-# Every 6 hours
-0 */6 * * * /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
-
-# Weekly on Sunday at 3 AM
-0 3 * * 0 /usr/local/bin/backup-k8s.sh >> /var/log/k8s-backup.log 2>&1
+# Remember logrotate for /var/log/*backup*.log

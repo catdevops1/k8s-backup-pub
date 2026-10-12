@@ -1,135 +1,242 @@
 #!/bin/bash
-# Kubernetes Cluster Restore Script
-# Restores etcd snapshot and certificates from backup
-
+#
+# Kubernetes cluster restore — from R2 or from the local secondary copy
+#
+# Restores etcd, PKI, kubeconfigs and static pod manifests onto a control-plane
+# node. Two situations, both handled:
+#
+#   in-place  — the node still has a working kubeadm install; this rolls etcd
+#               back to a snapshot. Run this script and it does everything.
+#
+#   rebuild   — fresh host, nothing installed. Run this script with --prepare-only
+#               to lay down PKI and etcd data, then run `kubeadm init` yourself.
+#               PKI MUST be in place before init, or kubeadm generates a new CA
+#               and every existing worker credential becomes invalid.
+#
+# Configuration: shares /etc/default/backup-k8s with backup-k8s.sh.
+#
 set -euo pipefail
 
-# Configuration
-BACKUP_ROOT="${BACKUP_ROOT:-/mnt/backup/k8s-backups}"
-MASTER_NODE_NAME="${MASTER_NODE_NAME:-master-node}"
-MASTER_NODE_IP="${MASTER_NODE_IP:-192.168.4.100}"
+# ---------------------------------------------------------------- config ----
+R2_REMOTE="r2:BUCKET/cluster"
+LOCAL_MOUNT="/mnt/backup"
+LOCAL_ROOT=""
 
-if [ $# -eq 0 ]; then
-    echo "Usage: $0 <backup-directory>"
+# shellcheck disable=SC1091
+[ -f /etc/default/backup-k8s ] && . /etc/default/backup-k8s
+LOCAL_ROOT="${LOCAL_ROOT:-${LOCAL_MOUNT}/k8s-backups}"
+
+MASTER_NAME="${MASTER_NAME:-$(hostname)}"
+MASTER_IP="${MASTER_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')}"
+
+PREPARE_ONLY=0
+SOURCE=""
+
+# ------------------------------------------------------------- utilities ----
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+fail() { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: $0 [--prepare-only] <backup-directory | R2-timestamp>
+
+  --prepare-only   Restore PKI and etcd data but do not touch kubelet.
+                   Use this on a rebuilt host, then run kubeadm init.
+
+Local backups:
+EOF
+    ls -1dt "${LOCAL_ROOT}"/20* 2>/dev/null | head -10 | sed 's/^/  /' \
+        || echo "  (none — is ${LOCAL_MOUNT} mounted?)"
     echo ""
-    echo "Available backups:"
-    ls -lhtr "$BACKUP_ROOT/" 2>/dev/null | grep "^d" | tail -10
+    echo "Off-site backups (R2):"
+    rclone lsf --dirs-only "$R2_REMOTE" 2>/dev/null | sort -r | head -10 | sed 's/^/  /' \
+        || echo "  (rclone not configured or R2 unreachable)"
     echo ""
-    echo "Example:"
-    echo "  $0 $BACKUP_ROOT/latest"
-    echo "  $0 $BACKUP_ROOT/20251010-133000"
-    echo ""
-    echo "Configuration (set via environment variables):"
-    echo "  BACKUP_ROOT=$BACKUP_ROOT"
-    echo "  MASTER_NODE_NAME=$MASTER_NODE_NAME"
-    echo "  MASTER_NODE_IP=$MASTER_NODE_IP"
+    echo "Examples:"
+    echo "  $0 ${LOCAL_ROOT}/latest"
+    echo "  $0 20260830-000001                 # pulls from R2"
+    echo "  $0 --prepare-only 20260830-000001  # rebuild: init afterwards"
     exit 1
+}
+
+# ------------------------------------------------------------ arguments -----
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --prepare-only) PREPARE_ONLY=1; shift ;;
+        -h|--help)      usage ;;
+        *)              SOURCE="$1"; shift ;;
+    esac
+done
+[ -n "$SOURCE" ] || usage
+
+# ------------------------------------------------- resolve the source -------
+# A bare timestamp means "fetch it from R2"; anything else is a local path.
+if [ -d "$SOURCE" ]; then
+    BACKUP_DIR="$SOURCE"
+    log "Using local backup: ${BACKUP_DIR}"
+else
+    command -v rclone >/dev/null || fail "'${SOURCE}' is not a directory and rclone is not installed"
+    case "$R2_REMOTE" in
+        *BUCKET*) fail "R2_REMOTE is not configured — set it in /etc/default/backup-k8s" ;;
+    esac
+    BACKUP_DIR="$(mktemp -d /tmp/k8s-restore.XXXXXX)"
+    chmod 700 "$BACKUP_DIR"
+    trap 'rm -rf "$BACKUP_DIR"' EXIT
+    log "Fetching ${R2_REMOTE}/${SOURCE} ..."
+    rclone copy "${R2_REMOTE}/${SOURCE}" "$BACKUP_DIR" --stats-one-line \
+        || fail "could not fetch ${SOURCE} from R2"
 fi
 
-BACKUP_DIR="$1"
+# ------------------------------------------------------ validate source -----
+[ -f "${BACKUP_DIR}/etcd-snapshot.db" ] || fail "no etcd-snapshot.db in ${BACKUP_DIR}"
 
-if [ ! -d "$BACKUP_DIR" ]; then
-    echo "ERROR: Backup directory not found: $BACKUP_DIR"
-    exit 1
+# Integrity first. A corrupted backup discovered mid-restore is worse than one
+# discovered before the current etcd data has been moved aside.
+if [ -f "${BACKUP_DIR}/SHA256SUMS" ]; then
+    log "Verifying checksums..."
+    ( cd "$BACKUP_DIR" && sha256sum -c --quiet SHA256SUMS ) \
+        || fail "checksum mismatch — this backup is damaged, do not use it"
+else
+    log "WARNING: no SHA256SUMS in this backup, skipping integrity check"
 fi
 
-if [ ! -f "${BACKUP_DIR}/etcd-snapshot.db" ]; then
-    echo "ERROR: etcd snapshot not found in backup directory"
-    exit 1
+# Pick the right tool. etcdutl is the supported one for offline operations;
+# etcd 3.6 removed `etcdctl snapshot status/restore`, and on a rebuilt host
+# neither may be present.
+if command -v etcdutl >/dev/null 2>&1; then
+    ETCD_RESTORE=(etcdutl snapshot restore)
+    ETCD_STATUS=(etcdutl snapshot status)
+elif command -v etcdctl >/dev/null 2>&1; then
+    export ETCDCTL_API=3
+    ETCD_RESTORE=(etcdctl snapshot restore)
+    ETCD_STATUS=(etcdctl snapshot status)
+else
+    fail "neither etcdutl nor etcdctl found — install etcdutl matching your etcd version"
 fi
 
-echo "⚠️  WARNING: This will restore your cluster from backup!"
-echo "This is a DESTRUCTIVE operation that will:"
-echo "  - Stop all cluster operations"
-echo "  - Replace current etcd data with backup"
-echo "  - Restart the cluster"
+log "Snapshot contents:"
+"${ETCD_STATUS[@]}" "${BACKUP_DIR}/etcd-snapshot.db" --write-out=table \
+    || fail "snapshot will not parse — refusing to restore from it"
+
+for f in ca.crt ca.key sa.key; do
+    [ -f "${BACKUP_DIR}/pki-backup/${f}" ] \
+        || fail "backup is missing ${f}; workers would need a full rejoin"
+done
+
+# ---------------------------------------------------------- confirmation ----
 echo ""
-echo "Backup to restore from:"
-cat "${BACKUP_DIR}/backup-info.txt" 2>/dev/null || echo "No backup info found"
+[ -f "${BACKUP_DIR}/backup-info.txt" ] && cat "${BACKUP_DIR}/backup-info.txt"
 echo ""
-read -p "Are you ABSOLUTELY sure? (type 'yes' to continue): " confirm
+echo "This will REPLACE cluster state on ${MASTER_NAME} (${MASTER_IP})."
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+    echo "Mode: prepare-only — PKI and etcd data will be laid down, kubelet untouched."
+else
+    echo "Mode: in-place — kubelet will be stopped, etcd replaced, kubelet restarted."
+    echo "Current etcd data will be moved aside, not deleted."
+fi
+echo ""
+read -rp "Type 'yes' to proceed: " confirm
+[ "$confirm" = "yes" ] || { echo "Cancelled."; exit 0; }
 
-if [ "$confirm" != "yes" ]; then
-    echo "Restore cancelled."
+# ------------------------------------------------------------- restore ------
+if [ "$PREPARE_ONLY" -eq 0 ]; then
+    log "Stopping kubelet..."
+    sudo systemctl stop kubelet
+    # Containers outlive the kubelet; give the static pods a moment to exit so
+    # etcd is not still writing to the data directory we are about to move.
+    sleep 10
+fi
+
+TIMESTAMP="$(date +%s)"
+if [ -d /var/lib/etcd ]; then
+    log "Moving current etcd data to /var/lib/etcd.backup.${TIMESTAMP}"
+    sudo mv /var/lib/etcd "/var/lib/etcd.backup.${TIMESTAMP}"
+fi
+
+# PKI before anything that might generate certificates. On a rebuild this is
+# what makes `kubeadm init` reuse the existing CA instead of minting a new one.
+log "Restoring PKI..."
+sudo mkdir -p /etc/kubernetes/pki
+sudo cp -r "${BACKUP_DIR}/pki-backup/." /etc/kubernetes/pki/
+
+log "Restoring kubeconfigs..."
+sudo cp "${BACKUP_DIR}"/*.conf /etc/kubernetes/ 2>/dev/null || \
+    log "WARNING: no kubeconfigs in backup"
+
+if [ -d "${BACKUP_DIR}/manifests" ] && [ "$PREPARE_ONLY" -eq 0 ]; then
+    log "Restoring static pod manifests..."
+    sudo mkdir -p /etc/kubernetes/manifests
+    sudo cp "${BACKUP_DIR}/manifests"/*.yaml /etc/kubernetes/manifests/ 2>/dev/null || true
+fi
+
+log "Restoring etcd data..."
+sudo "${ETCD_RESTORE[@]}" "${BACKUP_DIR}/etcd-snapshot.db" \
+    --data-dir=/var/lib/etcd \
+    --name="$MASTER_NAME" \
+    --initial-cluster="${MASTER_NAME}=https://${MASTER_IP}:2380" \
+    --initial-advertise-peer-urls="https://${MASTER_IP}:2380" \
+    || fail "etcd restore failed — original data is at /var/lib/etcd.backup.${TIMESTAMP}"
+
+sudo chown -R root:root /var/lib/etcd /etc/kubernetes/pki
+
+# ---------------------------------------------------------------- finish ----
+if [ "$PREPARE_ONLY" -eq 1 ]; then
+    cat <<EOF
+
+=== Prepared ===
+
+PKI and etcd data are in place. Now initialise the control plane:
+
+  sudo kubeadm init \\
+    --apiserver-advertise-address=${MASTER_IP} \\
+    --control-plane-endpoint=${MASTER_IP} \\
+    --pod-network-cidr=10.244.0.0/16 \\
+    --ignore-preflight-errors=DirAvailable--var-lib-etcd
+
+kubeadm will detect the restored CA and reuse it, so existing workers keep their
+credentials. Reinstall the CNI afterwards, then check the nodes reconnect.
+EOF
     exit 0
 fi
 
-echo ""
-echo "=== Starting Cluster Restore ==="
-echo ""
-
-# 1. Stop kubelet to prevent interference
-echo "Step 1: Stopping kubelet..."
-sudo systemctl stop kubelet
-sleep 5
-
-# 2. Move current etcd data as backup
-echo "Step 2: Backing up current etcd data..."
-TIMESTAMP=$(date +%s)
-if [ -d /var/lib/etcd ]; then
-    sudo mv /var/lib/etcd /var/lib/etcd.backup.${TIMESTAMP}
-    echo "Current etcd data saved to: /var/lib/etcd.backup.${TIMESTAMP}"
-fi
-
-# 3. Restore etcd snapshot
-echo "Step 3: Restoring etcd snapshot..."
-sudo ETCDCTL_API=3 etcdctl snapshot restore \
-  "${BACKUP_DIR}/etcd-snapshot.db" \
-  --data-dir=/var/lib/etcd \
-  --name="$MASTER_NODE_NAME" \
-  --initial-cluster="$MASTER_NODE_NAME=https://$MASTER_NODE_IP:2380" \
-  --initial-advertise-peer-urls="https://$MASTER_NODE_IP:2380"
-
-# 4. Fix permissions
-echo "Step 4: Fixing permissions..."
-sudo chown -R root:root /var/lib/etcd
-
-# 5. Restore PKI certificates if they exist in backup
-if [ -d "${BACKUP_DIR}/pki-backup" ]; then
-    echo "Step 5: Restoring PKI certificates..."
-    sudo cp -r "${BACKUP_DIR}/pki-backup"/* /etc/kubernetes/pki/
-else
-    echo "Step 5: No PKI backup found, skipping..."
-fi
-
-# 6. Start kubelet
-echo "Step 6: Starting kubelet..."
+log "Starting kubelet..."
 sudo systemctl start kubelet
 
-echo ""
-echo "=== Restore Process Complete ==="
-echo ""
-echo "Waiting 30 seconds for cluster to stabilize..."
-sleep 30
+log "Waiting for the API server..."
+for i in $(seq 1 60); do
+    if kubectl --kubeconfig=/etc/kubernetes/admin.conf get --raw='/readyz' >/dev/null 2>&1; then
+        log "API server responding after ${i}0s"
+        break
+    fi
+    [ "$i" -eq 60 ] && log "WARNING: API server not responding after 10 minutes"
+    sleep 10
+done
 
+export KUBECONFIG=/etc/kubernetes/admin.conf
 echo ""
-echo "Checking cluster status..."
+kubectl get nodes 2>/dev/null || echo "Nodes not available yet."
 echo ""
+kubectl get pods -n kube-system 2>/dev/null | grep -E 'etcd|apiserver|controller|scheduler' \
+    || echo "Control plane pods not available yet."
 
-# Check node status
-echo "Node Status:"
-kubectl get nodes || echo "⚠️  Nodes not ready yet, wait a bit longer..."
-echo ""
+cat <<EOF
 
-# Check control plane pods
-echo "Control Plane Pods:"
-kubectl get pods -n kube-system | grep -E "etcd|apiserver|controller|scheduler" || echo "⚠️  Control plane not ready yet..."
-echo ""
+=== Restore complete ===
 
-# Check all pods
-echo "All Pods (first 20):"
-kubectl get pods -A | head -20 || echo "⚠️  Unable to get pods yet..."
-echo ""
+Verify:
+  kubectl get nodes
+  kubectl get pods -A | grep -v Running
+  kubectl get application -n argocd        # ArgoCD will resync from git
 
-echo "✅ Restore completed!"
-echo ""
-echo "Next steps:"
-echo "  1. Check cluster health: kubectl get nodes"
-echo "  2. Verify pods are running: kubectl get pods -A"
-echo "  3. Check your applications are working"
-echo ""
-echo "If there are issues, you can restore the previous etcd data:"
-echo "  sudo systemctl stop kubelet"
-echo "  sudo rm -rf /var/lib/etcd"
-echo "  sudo mv /var/lib/etcd.backup.${TIMESTAMP} /var/lib/etcd"
-echo "  sudo systemctl start kubelet"
+Workers may take a few minutes to reconnect. If one does not:
+  ssh <worker> 'sudo systemctl restart kubelet'
+
+Longhorn volumes and Vault contents are NOT restored by this script. Databases
+must be restored separately from their pg_dump files.
+
+To roll back this restore:
+  sudo systemctl stop kubelet
+  sudo rm -rf /var/lib/etcd
+  sudo mv /var/lib/etcd.backup.${TIMESTAMP} /var/lib/etcd
+  sudo systemctl start kubelet
+EOF
